@@ -3343,6 +3343,7 @@ retry:
 	pg_req.order = order;
 	pg_req.alloc_flags = alloc_flags | ALLOC_NO_WATERMARKS;
 	pg_req.ac = ac;
+	pg_req.new_page = NULL;
 	pg_req.alloc_done = &alloc_done;
 
 	spin_lock_irqsave(&oom_queue_lock, flags);
@@ -3352,10 +3353,25 @@ retry:
 	atomic_inc(&simple_lmk_refcnt);
 
 	/* Keep performing memory reclaim until we get our memory */
-	do {
-		simple_lmk_mem_reclaim();
-	} while (!wait_for_completion_timeout(&alloc_done, LMK_KILL_TIMEOUT));
+	while (1) {
+		long ret;
 
+		simple_lmk_mem_reclaim();
+		ret = wait_for_completion_killable_timeout(&alloc_done,
+							LMK_KILL_TIMEOUT);
+		if (ret) {
+			if (ret == -ERESTARTSYS) {
+				/* Give up since this process is dying */
+				spin_lock_irqsave(&oom_queue_lock, flags);
+				if (!pg_req.new_page)
+					list_del(&pg_req.list);
+				spin_unlock_irqrestore(&oom_queue_lock, flags);
+			}
+			break;
+		}
+	}
+
+	atomic_dec(&simple_lmk_refcnt);
 	page = pg_req.new_page;
 	goto got_pg;
 #endif
@@ -3540,7 +3556,6 @@ static void simple_lmk_fulfill_reqs(struct page *page)
 
 		pg_req->new_page = new_page;
 		list_del(&pg_req->list);
-		atomic_dec(&simple_lmk_refcnt);
 		complete(pg_req->alloc_done);
 
 		/* Stop if the newly-freed page just got allocated */

@@ -45,6 +45,9 @@ static unsigned long last_reclaim_expires;
 static unsigned long scan_and_kill(int min_adj, int max_adj,
 	unsigned long pages_needed)
 {
+	struct sched_param param = {
+		.sched_priority = MAX_RT_PRIO - 1
+	};
 	struct task_struct *tsk;
 	unsigned long pages_freed = 0;
 
@@ -54,7 +57,8 @@ static unsigned long scan_and_kill(int min_adj, int max_adj,
 		unsigned long tasksize;
 		short oom_score_adj;
 
-		if (tsk->flags & PF_KTHREAD)
+		/* Don't commit suicide or kill kthreads */
+		if (same_thread_group(tsk, current) || tsk->flags & PF_KTHREAD)
 			continue;
 
 		victim = find_lock_task_mm(tsk);
@@ -79,9 +83,10 @@ static unsigned long scan_and_kill(int min_adj, int max_adj,
 		if (!tasksize)
 			continue;
 
-		/* Don't force the SIGKILL so Android doesn't explode */
+		/* Boost priority of victim so it can die quickly */
+		sched_setscheduler_nocheck(victim, SCHED_FIFO, &param);
 		victim->lmk_sigkill_sent = true;
-		send_sig(SIGKILL, victim, 0);
+		do_send_sig_info(SIGKILL, SEND_SIG_FORCED, victim, true);
 
 		pages_freed += tasksize;
 		if (pages_freed >= pages_needed)
@@ -110,18 +115,20 @@ static void do_lmk_reclaim(unsigned long pages_needed)
 
 void simple_lmk_mem_reclaim(void)
 {
+	unsigned long flags;
+
 	if (time_before(jiffies, last_reclaim_expires))
 		return;
 
 	/* Only one memory reclaim event can occur at a time */
-	if (!spin_trylock(&reclaim_lock))
+	if (!spin_trylock_irqsave(&reclaim_lock, flags))
 		return;
 
 	last_reclaim_expires = jiffies + LMK_KILL_TIMEOUT;
 	cpu_input_boost_kick_max(BOOST_DURATION_MS);
 	devfreq_boost_kick_max(DEVFREQ_MSM_CPUBW, BOOST_DURATION_MS);
 	do_lmk_reclaim(MIN_FREE_PAGES);
-	spin_unlock(&reclaim_lock);
+	spin_unlock_irqrestore(&reclaim_lock, flags);
 }
 
 /* Needed to prevent Android from thinking there's no LMK and thus rebooting */
